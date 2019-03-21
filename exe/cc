@@ -1,0 +1,263 @@
+#!/usr/bin/env ruby
+#
+require 'vkontakte_api'
+require 'tty-spinner'
+require 'tty-table'
+require 'tty-progressbar'
+require 'tty-prompt'
+require 'thread'
+require 'catpix_mini'
+require 'tempfile'
+
+
+Hashie.logger.level = "ERROR"
+VkontakteApi.configure do |config|
+  # параметры, необходимые для авторизации средствами vkontakte_api
+  # (не нужны при использовании сторонней авторизации)
+  config.app_id = ENV['APP_ID']
+  config.app_secret = ENV['APP_SECRET']
+  config.redirect_uri = 'http://api.vkontakte.ru/blank.html'
+  config.api_version = '5.91'
+
+  config.log_errors = true
+  config.log_requests = false
+  config.log_responses = false
+end
+
+
+def collect(type:, collect_meth:)
+  offset = 0
+  continue = true
+  items = []
+  while continue do
+    response = collect_meth.call(count: 100, offset: offset)
+    if response.items.empty?
+      continue = false
+    else
+      response.items.each do |item|
+        items << {
+          item_id: item.id,
+          owner_id: item.owner_id,
+          type: type
+        }
+      end
+      offset = offset + response.items.size
+      #@prompt.say(offset)
+    end
+    sleep(0.9)
+    continue = false
+  end
+  items
+end
+
+
+def vkjs_start
+  <<-VKJS
+var a = [];
+  VKJS
+end
+
+def vkjs_finish
+  <<-VKJS
+return a;
+  VKJS
+end
+
+def vkjs_string(item:)
+  <<-VKJS
+a.push(API.likes.delete({"type":"#{item[:type]}","item_id":#{item[:item_id]},"owner_id":#{item[:owner_id]}}));
+  VKJS
+end
+
+def render_image_terminal(url)
+  uri = URI.parse(url)
+  resp = Faraday.new.get(uri)
+  file = Tempfile.new('vk_capcha')
+  file.binmode
+  file.write(resp.body)
+  file.flush
+  file
+  CatpixMini::print_image(file.path,
+                          resolution: 'auto')
+end
+
+def clean_via_execute(items: [])
+  js = vkjs_start
+  items.each_with_index do |item, index|
+    js += vkjs_string(item: item)
+    if ((index + 1) % 24 == 0) || (index == items.size - 1)
+      with_vk_capcha do |captcha_key, captcha_sid|
+        #  js = vkjs_start
+        #  js += 'a = API.photos.search({"q":"Nature","count":3});'
+        js += vkjs_finish
+        # binding.irb
+        @vk.execute(code: js, captcha_key: captcha_key, captcha_sid: captcha_sid)
+        #binding.irb
+        js = vkjs_start
+        sleep(3)
+      end
+    end
+  end
+
+end
+
+def with_vk_capcha
+  captcha_key = nil
+  captcha_sid = nil
+  begin
+    yield(captcha_key, captcha_sid) if block_given?
+  rescue VkontakteApi::Error => e
+    if e.captcha_img
+      #`xdg-open #{e.captcha_img}`
+      render_image_terminal(e.captcha_img)
+      captcha_key = @prompt.ask('capcha?', default: '')
+      captcha_sid = e.captcha_sid
+      retry
+    end
+  end
+end
+
+def clean_no_suspect(items: [])
+  items.each_with_index do |item, index|
+    yield(item) if block_given?
+    with_vk_capcha do |captcha_key, captcha_sid|
+      @vk.likes.delete(type: item[:type], item_id: item[:item_id], owner_id: item[:owner_id], captcha_key: captcha_key, captcha_sid: captcha_sid)
+      sleep(4)
+    end
+  end
+end
+
+
+@prompt = TTY::Prompt.new
+
+@prompt.say("Hello")
+@prompt.say("You can provide VK AUTH token by env VK_TOKEN")
+
+
+url = VkontakteApi.authorization_url(type: :client, scope: [:likes, :friends, :photos, :wall])
+
+@prompt.say("You can grab token from url string at blow url")
+@prompt.say(url)
+
+favs = {
+  videos: [].to_set,
+  photos: [].to_set,
+  posts: [].to_set
+}
+
+token = @prompt.ask('token?', default: ENV['VK_TOKEN'])
+
+@vk = VkontakteApi::Client.new(token)
+
+view_collect = TTY::Spinner::Multi.new("[:spinner] collect favorites")
+
+view_collect_videos = view_collect.register "[:spinner] videos"
+view_collect_photos = view_collect.register "[:spinner] photos"
+view_collect_posts = view_collect.register "[:spinner] posts"
+
+collectors = []
+cleaners = []
+
+collectors << Thread.new do
+  view_collect_videos.auto_spin
+  favs[:videos] = collect(type: :video, collect_meth: ->(count:, offset:) { @vk.fave.get_videos(count: count, offset: offset) })
+  view_collect_videos.success
+end
+
+collectors << Thread.new do
+  view_collect_photos.auto_spin
+  favs[:photos] = collect(type: :photo, collect_meth: ->(count:, offset:) { @vk.fave.get_photos(count: count, offset: offset) })
+  view_collect_photos.success
+end
+
+collectors << Thread.new do
+  view_collect_posts.auto_spin
+  favs[:posts] = collect(type: :post, collect_meth: ->(count:, offset:) { @vk.fave.get_posts(count: count, offset: offset) })
+  view_collect_posts.success
+end
+
+collectors.each(&:join)
+
+
+table = TTY::Table.new ['Total Videos', 'Total Posts', 'Total Photos'], [[favs[:videos].count, favs[:posts].count, favs[:photos].count]]
+renderer = TTY::Table::Renderer::Unicode.new(table)
+puts renderer.render
+
+
+def photo_path(item)
+  "https://vk.com/feed?z=photo#{item[:owner_id]}_#{item[:item_id]}"
+end
+
+rows = favs[:photos].map do |photo|
+  [photo_path(photo)]
+end
+
+#photo_table = TTY::Table.new ['url'], rows
+#renderer = TTY::Table::Renderer::Unicode.new(photo_table)
+#puts renderer.render
+
+choices = %w(posts videos photos)
+
+#@prompt.keypress("Press space or enter to continue", keys: [:space, :return])
+if clean_choice = @prompt.multi_select("Select what likes clean?", choices)
+  items_to_clear = []
+
+  view_clear = TTY::ProgressBar::Multi.new("main [:bar] :current/:total :elapsed :percent")
+
+  if clean_choice.include?("videos")
+    items_to_clear += favs[:videos]
+    view_clear_videos = view_clear.register("videos [:bar] :percent", total: favs[:videos].count)
+  end
+  if clean_choice.include?("photos")
+    items_to_clear += favs[:photos]
+    view_clear_photos = view_clear.register("photos [:bar] :percent", total: favs[:photos].count)
+  end
+  if clean_choice.include?("posts")
+    items_to_clear += favs[:posts]
+    view_clear_posts = view_clear.register("posts [:bar] :percent", total: favs[:posts].count)
+  end
+
+  view_clear.start
+
+
+  cleaners << Thread.new do
+    #clean_via_execute(
+    clean_no_suspect(
+      items: items_to_clear
+    ) do |item|
+      #binding.irb
+      view_clear_videos.advance if item[:type] == :video
+      view_clear_posts.advance if item[:type] == :post
+      view_clear_photos.advance if item[:type] == :photo
+    end
+  end
+
+
+=begin
+  cleaners << Thread.new do
+    clean_no_suspect(
+      items: favs[:videos],
+      callback: ->() { view_clear_videos.advance }
+    )
+  end if clean_choice.include?("videos")
+
+  cleaners << Thread.new do
+    favs[:photos].each do |item|
+      clean(item: item)
+      view_clear_photos.advance
+    end
+  end if clean_choice.include?("posts")
+
+  cleaners << Thread.new do
+    favs[:posts].each do |item|
+      clean(item: item)
+      view_clear_posts.advance
+    end
+  end if clean_choice.include?("photos")
+=end
+
+  cleaners.each { |t| t.join }
+end
+
+
+@prompt.say("GLHF")
